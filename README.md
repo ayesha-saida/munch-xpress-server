@@ -1,0 +1,1 @@
+This backend repository contains the server-side implementation of MunchXpress.
