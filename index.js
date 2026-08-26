@@ -7,16 +7,10 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // Firebase
-const { initializeApp, cert } = require("firebase-admin/app");
-const { getAuth } = require("firebase-admin/auth");
 
-const serviceAccount = JSON.parse(
-  Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString("utf-8")
-);
+//middlewire
+const { verifyToken, requireAdmin } = require("./middlewares/auth");
 
-initializeApp({
-  credential: cert(serviceAccount),
-});
 
 // MongoDB
 const { MongoClient, ServerApiVersion } = require("mongodb");
@@ -33,7 +27,7 @@ app.use(express.json());
 
 app.use(
   cors({
-    origin: ["http://localhost:5173"],
+    origin: process.env.SITE_DOMAIN,
   })
 );
 
@@ -42,77 +36,60 @@ app.get("/", (req, res) => {
 });
 
 
-// jwt middlewares
-const verifyJWT = async (req, res, next) => {
-  const token = req?.headers?.authorization?.split(' ')[1]
-  console.log(token)
-  if (!token) return res.status(401).send({ message: 'Unauthorized Access!' })
-  try {
-    const decoded = await admin.auth().verifyIdToken(token)
-    req.tokenEmail = decoded.email
-    console.log(decoded)
-    next()
-  } catch (err) {
-    console.log(err)
-    return res.status(401).send({ message: 'Unauthorized Access!', err })
-  }
-}
-
-
-
 async function run() {
   try {
    await client.connect();
 
     const db = client.db('MunchXpress') 
     const userCollection = db.collection('users')
-
+    const adminOnly = requireAdmin(userCollection)
 
     // Users related API's
-   app.post('/users', async(req, res) => {
+    app.post('/users', verifyToken, async (req, res) => {
       try {
-          const user = req.body
-          user.role = 'customer'
-          user.createdAt = new Date()
+        const { email, uid } = req.decoded
+        const name = (req.body?.name || '').trim()
+        const photoURL = (req.body?.photoURL || '').trim()
 
-          const email = user.email
-          const userExists = await userCollection.findOne({ email })
+        const existing = await userCollection.findOne({ email })
 
-           if(userExists) {  // prevent duplicate insertion
-              return res.send({ message: 'user exists' })
-        }  
-            // Insert user
-           const result = await userCollection.insertOne(user);
-           const createdUser = await userCollection.findOne({ _id: result.insertedId });  
+        if (existing) {           
+          const refreshed = {}
+          if (name && name !== existing.name) refreshed.name = name
+          if (photoURL && photoURL !== existing.photoURL) refreshed.photoURL = photoURL
 
-            res.status(201).json({ success: true, user: createdUser })
-           }
-              catch (err) {
-            res.status(500).json({ success: false, message: err.message })
-           }        
+          if (Object.keys(refreshed).length) {
+            await userCollection.updateOne({ email }, { $set: refreshed })
+          }
+
+          return res.send({
+            success: true,
+            existed: true,
+            user: { ...existing, ...refreshed },
+          })
+        }
+
+        const user = {
+          uid,
+          email,
+          name,
+          photoURL,
+          role: 'customer',
+          createdAt: new Date(),
+        }
+
+        const result = await userCollection.insertOne(user)
+
+        res.status(201).json({
+          success: true,
+          existed: false,
+          user: { ...user, _id: result.insertedId },
         })
-    
-    app.get('/users',  async (req, res) => {  
-      const {email} = req.query
-
-      const query = email? { email } : {}
-            const cursor = userCollection.find(query).sort({ createdAt: -1 });
-            const result = await cursor.toArray();
-            res.send(result);
-        }); 
-    
-    app.get('/users/:email', async(req,res) => {
-       const { email } = req.params;
-
-       const user = await userCollection.findOne({ email });
-
-         if (!user) {
-          return res.status(404).send({ message: 'User not found' });
-         }
-       res.send(user);
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
     })
-
-
+ 
     app.listen(port, () => {
        console.log(`Server is running on port ${port}`)
     })
