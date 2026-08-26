@@ -42,7 +42,7 @@ async function run() {
 
     const db = client.db('MunchXpress') 
     const userCollection = db.collection('users')
-    const adminOnly = requireAdmin(userCollection)
+    const adminOnly = requireAdmin(userCollection)  
 
     // Users related API's
     app.post('/users', verifyToken, async (req, res) => {
@@ -88,8 +88,44 @@ async function run() {
       } catch (err) {
         res.status(500).json({ success: false, message: err.message })
       }
+    })  
+    
+  
+    app.get('/users', verifyToken, adminOnly, async (req, res) => {
+      try {
+        const { email, role } = req.query
+
+        const query = {}
+        if (email) query.email = email
+        if (role) query.role = role
+
+        const result = await userCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .toArray()
+
+        res.send(result)
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })      
+    
+
+    app.get('/users/:email', verifyToken, adminOnly, async (req, res) => {
+      try {
+        const user = await userCollection.findOne({ email: req.params.email })
+
+        if (!user) {
+          return res.status(404).json({ success: false, message: 'User not found' })
+        }
+
+        res.send(user)
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
     })
- 
+
+
     app.listen(port, () => {
        console.log(`Server is running on port ${port}`)
     })
