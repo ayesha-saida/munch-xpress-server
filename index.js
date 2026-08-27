@@ -6,11 +6,9 @@ const cors = require("cors");
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Firebase
-
 //middlewire
 const { verifyToken, requireAdmin } = require("./middlewares/auth");
-
+const { validateSellerRequest } = require("./utils/sellerRequest");
 
 // MongoDB
 const { MongoClient, ServerApiVersion } = require("mongodb");
@@ -43,7 +41,9 @@ async function run() {
     const db = client.db('MunchXpress') 
     const userCollection = db.collection('users')
     const adminOnly = requireAdmin(userCollection)  
+    const sellerRequestCollection = db.collection('sellerRequests')
 
+    
     // Users related API's
     app.post('/users', verifyToken, async (req, res) => {
       try {
@@ -120,6 +120,77 @@ async function run() {
         }
 
         res.send(user)
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+  
+    // Seller request related API's
+    app.post('/seller-requests', verifyToken, async (req, res) => {
+      try {
+        const { email, uid } = req.decoded
+
+        const account = await userCollection.findOne({ email })
+
+        if (!account) {
+          return res.status(404).json({ success: false, message: 'User not found' })
+        }
+
+        if (account.role !== 'customer') {
+          return res.status(409).json({
+            success: false,
+            message: `A ${account.role} account cannot apply to become a seller`,
+          })
+        }
+
+        const pending = await sellerRequestCollection.findOne({ email, status: 'pending' })
+
+        if (pending) {
+          return res.status(409).json({
+            success: false,
+            message: 'Your application is already waiting to be reviewed',
+          })
+        }
+
+        const { errors, value } = validateSellerRequest(req.body)
+
+        if (errors.length) {
+          return res.status(400).json({ success: false, message: errors[0], errors })
+        }
+
+        const request = {
+          ...value,
+          uid,
+          email,
+          status: 'pending',
+          appliedAt: new Date(),
+          reviewedAt: null,
+          reviewedBy: null,
+          note: '',
+        }
+
+        const result = await sellerRequestCollection.insertOne(request)
+
+        res.status(201).json({
+          success: true,
+          request: { ...request, _id: result.insertedId },
+        })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+
+    // returns the caller’s latest seller application
+    app.get('/seller-requests/me', verifyToken, async (req, res) => {
+      try {
+        const request = await sellerRequestCollection.findOne(
+          { email: req.decoded.email },
+          { sort: { appliedAt: -1 } }
+        )
+
+        res.send({ success: true, request: request || null })
       } catch (err) {
         res.status(500).json({ success: false, message: err.message })
       }
