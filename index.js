@@ -11,7 +11,7 @@ const { verifyToken, requireAdmin } = require("./middlewares/auth");
 const { validateSellerRequest } = require("./utils/sellerRequest");
 
 // MongoDB
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 
 const client = new MongoClient(process.env.MONGODB_URI, {
   serverApi: {
@@ -42,6 +42,7 @@ async function run() {
     const userCollection = db.collection('users')
     const adminOnly = requireAdmin(userCollection)  
     const sellerRequestCollection = db.collection('sellerRequests')
+    const restaurantCollection = db.collection('restaurants')    
 
     
     // Users related API's
@@ -196,6 +197,206 @@ async function run() {
       }
     })
 
+ 
+    /* seller request Admin APIs */
+
+    // get all seller requests
+    app.get('/seller-requests', verifyToken, adminOnly, async (req, res) => {
+      try {
+        const { status } = req.query
+        const allowedStatuses = ['pending', 'approved', 'rejected'] 
+
+        if (status && !allowedStatuses.includes(status)) {
+           return res.status(400).json({
+             success: false, 
+             message: "status must be one of 'pending', 'approved', or 'rejected'",
+             }) 
+          }
+        
+        const filter = status ? { status } : {}        
+        const result = await sellerRequestCollection
+          .find(filter)
+          .sort({ appliedAt: -1 })
+          .toArray()
+
+        res.send({ success: true, requests: result, })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+
+    // Approve or reject seller request
+    app.patch('/seller-requests/:id', verifyToken, adminOnly, async (req, res) => {
+      const session = client.startSession()
+
+      try {
+        const { id } = req.params
+        const { status, note } = req.body || {}
+
+        // Validate request ID
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ 
+            success: false, 
+            message: 'Invalid request id' })
+        }
+
+        // Validate request status
+        if (!['approved', 'rejected'].includes(status)) {
+          return res.status(400).json({
+            success: false,
+            message: "status must be either 'approved' or 'rejected'",
+          })
+        }
+
+        const requestId = new ObjectId(id) 
+        const cleanNote = typeof note === 'string' ? note.trim() : ''
+
+        if (status === 'rejected') {
+          const request = await sellerRequestCollection.findOneAndUpdate(
+            { _id: requestId, status: 'pending' }, 
+            { $set: { 
+              status: 'rejected', note: cleanNote, reviewedAt: new Date(),
+              reviewedBy: req.decoded.email }
+            },
+            { returnDocument: 'after', includeResultMetadata: false  })
+
+            if (!request) { 
+              return res.status(404).json({
+              success: false, 
+              message: 'No pending application with that id, it may already be reviewed'
+              }) 
+            }
+
+            return res.send({ 
+              success: true, request
+             })
+          }
+
+        const result = await session.withTransaction(async (session) => {
+          
+          // Find the pending request 
+          const request = await sellerRequestCollection.findOne( 
+            { _id: requestId, status: 'pending' },
+            { session } )                                           
+
+          if (!request) {
+            const error = new Error(
+              'No pending application with that id, it may already be reviewed' )            
+
+              error.statusCode = 404
+              throw error
+          }
+
+          // Make sure the applicant still exists 
+          const account = await userCollection.findOne( 
+            { email: request.email },
+            { session } )
+
+          if (!account) {
+            const error = new Error(
+            'Applicant account no longer exists')
+            
+            error.statusCode = 404
+            throw error 
+          }         
+
+      // Make sure the applicant is still a customer 
+      if (account.role !== 'customer') {
+         const error = new Error(
+           `This account is already a ${account.role} account and cannot be promoted to seller` )
+          
+          error.statusCode = 409 
+          throw error 
+      }
+
+      // Prevent the same seller from owning multiple restaurants.
+      const existingRestaurant = await restaurantCollection.findOne( 
+       { ownerEmail: request.email }, { session } )  
+
+      if (existingRestaurant) {
+         const error = new Error(
+         'This seller already owns a restaurant')
+
+          error.statusCode = 409
+          throw error
+      }  
+
+
+       /* included status: 'pending' in the filter so that two admins 
+        cannot successfully approve the same application.*/
+      const reviewedAt = new Date()
+
+      const updatedRequest = await sellerRequestCollection.findOneAndUpdate(
+         { _id: requestId, status: 'pending', },
+         { $set: { status: 'approved',
+           note: cleanNote,
+           reviewedAt,
+           reviewedBy: req.decoded.email }, 
+         },    
+         { returnDocument: 'after',
+           includeResultMetadata: false,
+           session } )
+
+      if (!updatedRequest) {
+        const error = new Error(
+           'No pending application with that id, it may already be reviewed' ) 
+
+        error.statusCode = 404
+        throw error
+      }  
+        
+      // Promote the customer to seller.
+      const becameSellerAt = account.becameSellerAt || reviewedAt
+      const userUpdate = await userCollection.updateOne( 
+          { email: request.email, role: 'customer' }, 
+          { $set: { role: 'seller', becameSellerAt }, },
+          { session, } )
+
+      if (userUpdate.matchedCount !== 1) {
+         const error = new Error(
+           'Applicant account could not be promoted to seller' ) 
+        
+        error.statusCode = 409
+        throw error 
+      }                    
+
+      // create restaurant 
+      const restaurant = {
+          requestId: request._id,
+          ownerEmail: request.email,
+          ownerUid: request.uid,
+          name: request.restaurantName,
+          phone: request.phone,
+          address: request.address,
+          cuisine: request.cuisine,
+          logoURL: request.logoURL,
+          status: 'active',
+          createdAt: new Date(),
+      }
+
+        const created = await restaurantCollection.insertOne( restaurant, { session } )
+
+      return {
+         request: updatedRequest, 
+         restaurant: { ...restaurant, _id: created.insertedId }, 
+        } })                 
+
+        // Transaction successfully committed
+      return res.send({
+          success: true,
+          request: result.request ,
+          restaurant: result.response,
+        })
+      } catch (err) {
+        console.error('Seller request review error:', err)
+
+        return res.status(err.statusCode || 500).json({ 
+          success: false,
+          message: err.message })
+      }
+    })  
+  
 
     app.listen(port, () => {
        console.log(`Server is running on port ${port}`)
