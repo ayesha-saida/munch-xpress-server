@@ -31,4 +31,35 @@ const requireAdmin = (userCollection) => async (req, res, next) => {
   }
 }
 
-module.exports = { verifyToken, requireAdmin }
+const requireSeller = (userCollection, restaurantCollection) => async (req, res, next) => {
+  try {
+    const account = await userCollection.findOne({ email: req.decoded.email })
+
+    if (account?.role !== 'seller') {
+      return res.status(403).json({
+        success: false,
+        message: account?.role === 'admin'
+          ? 'Forbidden: admins do not own a restaurant'
+          : 'Forbidden: sellers only',
+      })
+    }
+
+    const restaurant = await restaurantCollection.findOne({ ownerEmail: account.email })
+
+    if (!restaurant) {
+      return res.status(404).json({
+        success: false,
+        message: 'No restaurant found for this account',
+      })
+    }
+
+    req.account = account
+    req.restaurant = restaurant
+
+    return next()
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message })
+  }
+}
+
+module.exports = { verifyToken, requireAdmin, requireSeller }

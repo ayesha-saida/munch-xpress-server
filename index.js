@@ -7,7 +7,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 //middlewire
-const { verifyToken, requireAdmin } = require("./middlewares/auth");
+const { verifyToken, requireAdmin} = require("./middlewares/auth");
 const { validateSellerRequest } = require("./utils/sellerRequest");
 
 // MongoDB
@@ -40,9 +40,10 @@ async function run() {
 
     const db = client.db('MunchXpress') 
     const userCollection = db.collection('users')
-    const adminOnly = requireAdmin(userCollection)  
     const sellerRequestCollection = db.collection('sellerRequests')
-    const restaurantCollection = db.collection('restaurants')    
+    const restaurantCollection = db.collection('restaurants') 
+    
+    const adminOnly = requireAdmin(userCollection) 
 
     
     // Users related API's
@@ -397,6 +398,36 @@ async function run() {
       }
     })  
   
+
+   // Restaurant related API's
+
+    app.get('/restaurants', async (req, res) => {
+      try {
+        const result = await restaurantCollection
+          .find({ status: 'active' })
+          .project({ name: 1, cuisine: 1, logoURL: 1 })
+          .sort({ name: 1 })
+          .toArray()
+
+        res.send({ success: true, restaurants: result })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+
+    app.get('/restaurants/mine', verifyToken, async (req, res) => {
+      try {
+        const restaurant = await restaurantCollection.findOne({
+          ownerEmail: req.decoded.email,
+        })
+
+        res.send({ success: true, restaurant: restaurant || null })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
 
     app.listen(port, () => {
        console.log(`Server is running on port ${port}`)
