@@ -517,6 +517,35 @@ async function run() {
     })
     
 
+    app.delete('/menu-items/:id', verifyToken, sellerOnly, async (req, res) => {
+      try {
+        const { id } = req.params
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ success: false, message: 'Invalid item id' })
+        }
+
+        const itemId = new ObjectId(id)
+
+        const item = await menuItemCollection.findOneAndDelete(
+          { _id: itemId, ownerEmail: req.decoded.email },
+          { includeResultMetadata: false }
+        )
+
+        if (!item) {
+          return res.status(404).json({
+            success: false,
+            message: 'No menu item of yours with that id',
+          })
+        }
+
+        res.send({ success: true, item })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })  
+
+    
     app.get('/menu-categories', (req, res) => {
       res.send({ success: true, categories })
     })
