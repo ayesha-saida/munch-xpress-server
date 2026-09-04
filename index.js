@@ -470,6 +470,11 @@ async function run() {
     })
 
 
+    app.get('/menu-categories', (req, res) => {
+      res.send({ success: true, categories })
+    })
+    
+
     app.listen(port, () => {
        console.log(`Server is running on port ${port}`)
     })
