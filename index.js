@@ -7,8 +7,9 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 //middlewire
-const { verifyToken, requireAdmin} = require("./middlewares/auth");
+const { verifyToken, requireAdmin, requireSeller } = require("./middlewares/auth");
 const { validateSellerRequest } = require("./utils/sellerRequest");
+const { validateMenuItem } = require("./utils/menuItem");
 
 // MongoDB
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
@@ -42,8 +43,15 @@ async function run() {
     const userCollection = db.collection('users')
     const sellerRequestCollection = db.collection('sellerRequests')
     const restaurantCollection = db.collection('restaurants') 
+    const menuItemCollection = db.collection('menuItems')
     
     const adminOnly = requireAdmin(userCollection) 
+    const sellerOnly = requireSeller(userCollection, restaurantCollection)
+
+    await Promise.all([
+      menuItemCollection.createIndex({ restaurantId: 1 }),
+      menuItemCollection.createIndex({ available: 1, createdAt: -1 }),
+    ])
 
     
     // Users related API's
@@ -423,6 +431,39 @@ async function run() {
         })
 
         res.send({ success: true, restaurant: restaurant || null })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+
+    // Menu item related API's
+
+    app.post('/menu-items', verifyToken, sellerOnly, async (req, res) => {
+      try {
+        const { errors, value } = validateMenuItem(req.body)
+
+        if (errors.length) {
+          return res.status(400).json({ success: false, message: errors[0], errors })
+        }
+
+        const now = new Date()
+
+        const item = {
+          ...value,
+          restaurantId: req.restaurant._id,
+          restaurantName: req.restaurant.name,
+          ownerEmail: req.decoded.email,
+          createdAt: now,
+          updatedAt: now,
+        }
+
+        const result = await menuItemCollection.insertOne(item)
+
+        res.status(201).json({
+          success: true,
+          item: { ...item, _id: result.insertedId },
+        })
       } catch (err) {
         res.status(500).json({ success: false, message: err.message })
       }
