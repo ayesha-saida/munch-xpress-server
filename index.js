@@ -469,11 +469,24 @@ async function run() {
       }
     })
 
+    app.get('/menu-items/mine', verifyToken, sellerOnly, async (req, res) => {
+        try {
+          const items = await menuItemCollection
+            .find({ restaurantId: req.restaurant._id })
+            .sort({ createdAt: -1 })
+            .toArray()
+
+          res.send({ success: true, items, restaurant: req.restaurant })
+        } catch (err) {
+          res.status(500).json({ success: false, message: err.message })
+        }
+    })
+    
 
     app.get('/menu-categories', (req, res) => {
       res.send({ success: true, categories })
     })
-    
+
 
     app.listen(port, () => {
        console.log(`Server is running on port ${port}`)
