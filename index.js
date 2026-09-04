@@ -551,6 +551,54 @@ async function run() {
     })
 
 
+    app.get('/menu-items', async (req, res) => {
+      try {
+        const { restaurantId, category, search, limit } = req.query
+
+        if (restaurantId && !ObjectId.isValid(restaurantId)) {
+          return res.status(400).json({ success: false, message: 'Invalid restaurant id' })
+        }
+
+        const openRestaurants = await restaurantCollection
+          .find({
+            status: 'active',
+            ...(restaurantId ? { _id: new ObjectId(restaurantId) } : {}),
+          })
+          .project({ _id: 1 })
+          .toArray()
+
+        if (openRestaurants.length === 0) {
+          return res.send({ success: true, items: [] })
+        }
+
+        const filter = {
+          available: true,
+          restaurantId: { $in: openRestaurants.map((one) => one._id) },
+        }
+
+        if (category) filter.category = category
+
+        if (search) {
+          const term = String(search).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+          if (term) filter.name = { $regex: term, $options: 'i' }
+        }
+
+        const capped = Math.min(Math.max(Number(limit) || 60, 1), 200)
+
+        const items = await menuItemCollection
+          .find(filter)
+          .sort({ createdAt: -1 })
+          .limit(capped)
+          .toArray()
+
+        res.send({ success: true, items })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+
     app.listen(port, () => {
        console.log(`Server is running on port ${port}`)
     })
