@@ -10,6 +10,8 @@ const port = process.env.PORT || 3000;
 const { verifyToken, requireAdmin, requireSeller } = require("./middlewares/auth");
 const { validateSellerRequest } = require("./utils/sellerRequest");
 const { validateMenuItem } = require("./utils/menuItem");
+const { normalizeQuantity, toMenuItemId, 
+        hydrateCart, maxQuantity } = require("./utils/cart");
 
 // MongoDB
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
@@ -44,6 +46,7 @@ async function run() {
     const sellerRequestCollection = db.collection('sellerRequests')
     const restaurantCollection = db.collection('restaurants') 
     const menuItemCollection = db.collection('menuItems')
+    const cartCollection = db.collection('carts')
     
     const adminOnly = requireAdmin(userCollection) 
     const sellerOnly = requireSeller(userCollection, restaurantCollection)
@@ -51,6 +54,7 @@ async function run() {
     await Promise.all([
       menuItemCollection.createIndex({ restaurantId: 1 }),
       menuItemCollection.createIndex({ available: 1, createdAt: -1 }),
+      cartCollection.createIndex({ email: 1 }, { unique: true }),
     ])
 
     
