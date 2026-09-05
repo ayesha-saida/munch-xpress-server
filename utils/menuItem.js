@@ -37,6 +37,18 @@ const toPrice = (value) => {
   return Math.round(amount * 100) / 100
 }
 
+const toQuantity = (value) => {
+  if (value === '' || value === null || value === undefined) {
+    return NaN
+  }
+
+  const quantity = Number(value)
+
+  if (!Number.isInteger(quantity)) return NaN
+
+  return quantity
+}
+
 const validateMenuItem = (body = {}, { partial = false } = {}) => {
   const errors = []
   const value = {}
@@ -58,6 +70,16 @@ const validateMenuItem = (body = {}, { partial = false } = {}) => {
       errors.push('Price must be greater than 0')
     } else if (value.price > maxPrice) {
       errors.push(`Price must be under ${maxPrice}`)
+    }
+  }
+
+  if (wants('quantity')) {
+    value.quantity = toQuantity(body.quantity)
+
+    if (Number.isNaN(value.quantity)) {
+      errors.push('Quantity must be a whole number')
+    } else if (value.quantity < 0) {
+      errors.push('Quantity cannot be negative')
     }
   }
 
