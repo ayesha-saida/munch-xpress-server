@@ -603,6 +603,216 @@ async function run() {
     })
 
 
+    // Cart related API's
+        const sendCart = async (res, email) => {
+      const cart = await cartCollection.findOne({ email })
+
+      const { items, subtotal, removed, staleIds } = await hydrateCart(cart, menuItemCollection)
+
+      if (staleIds.length) {
+        await cartCollection.updateOne(
+          { email },
+          {
+            $pull: { items: { menuItemId: { $in: staleIds } } },
+            $set: { updatedAt: new Date() },
+          }
+        )
+      }
+
+      return res.send({
+        success: true,
+        items,
+        subtotal,
+        removed,
+        count: items.reduce((sum, item) => sum + item.quantity, 0),
+      })
+    }
+
+    /* the caller's cart. An account that has never added anything gets an
+       empty cart rather than a 404 */
+    app.get('/cart', verifyToken, async (req, res) => {
+      try {
+        await sendCart(res, req.decoded.email)
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+    /*
+      Add a dish that is already there.
+
+      The dish is checked against the live menu first, so a hidden dish or one
+      belonging to a suspended restaurant cannot be added even if the id came
+      from a page that was left open.
+    */
+    app.post('/cart/items', verifyToken, async (req, res) => {
+      try {
+        const { email, uid } = req.decoded
+
+        const menuItemId = toMenuItemId(req.body?.menuItemId)
+
+        if (!menuItemId) {
+          return res.status(400).json({ success: false, message: 'Invalid menu item id' })
+        }
+
+        const quantity = normalizeQuantity(req.body?.quantity ?? 1)
+
+        if (quantity === null) {
+          return res.status(400).json({
+            success: false,
+            message: 'Quantity must be a whole number of at least 1',
+          })
+        }
+
+        const dish = await menuItemCollection.findOne({ _id: menuItemId })
+
+        if (!dish || dish.available === false) {
+          return res.status(404).json({
+            success: false,
+            message: 'That item is not on the menu right now',
+          })
+        }
+
+        const restaurant = await restaurantCollection.findOne({ _id: dish.restaurantId })
+
+        if (restaurant?.status !== 'active') {
+          return res.status(409).json({
+            success: false,
+            message: 'That restaurant is not taking orders right now',
+          })
+        }
+
+
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const bumped = await cartCollection.updateOne(
+            { email, 'items.menuItemId': menuItemId },
+            {
+              $inc: { 'items.$.quantity': quantity },
+              $set: { updatedAt: new Date() },
+            }
+          )
+
+          if (bumped.matchedCount > 0) break
+
+          try {
+            await cartCollection.updateOne(
+              { email },
+              {
+                $push: { items: { menuItemId, quantity, addedAt: new Date() } },
+                $set: { uid, updatedAt: new Date() },
+                $setOnInsert: { email, createdAt: new Date() },
+              },
+              { upsert: true }
+            )
+
+            break
+          } catch (error) {
+            if (error?.code !== 11000 || attempt === 1) throw error
+          }
+        }
+       
+        await cartCollection.updateOne(
+          {
+            email,
+            items: { $elemMatch: { menuItemId, quantity: { $gt: maxQuantity } } },
+          },
+          { $set: { 'items.$.quantity': maxQuantity } }
+        )
+
+        await sendCart(res, email)
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+    /* set a line's quantity outright. 0 is a removal rather than a bad request,
+       since that is what the stepper sends on its way down from 1 */
+    app.patch('/cart/items/:menuItemId', verifyToken, async (req, res) => {
+      try {
+        const { email } = req.decoded
+
+        const menuItemId = toMenuItemId(req.params.menuItemId)
+
+        if (!menuItemId) {
+          return res.status(400).json({ success: false, message: 'Invalid menu item id' })
+        }
+
+        if (Number(req.body?.quantity) === 0) {
+          await cartCollection.updateOne(
+            { email },
+            { $pull: { items: { menuItemId } }, $set: { updatedAt: new Date() } }
+          )
+
+          return await sendCart(res, email)
+        }
+
+        const quantity = normalizeQuantity(req.body?.quantity)
+
+        if (quantity === null) {
+          return res.status(400).json({
+            success: false,
+            message: 'Quantity must be a whole number between 0 and 99',
+          })
+        }
+
+        const updated = await cartCollection.updateOne(
+          { email, 'items.menuItemId': menuItemId },
+          { $set: { 'items.$.quantity': quantity, updatedAt: new Date() } }
+        )
+
+        if (updated.matchedCount === 0) {
+          return res.status(404).json({
+            success: false,
+            message: 'That item is not in your cart',
+          })
+        }
+
+        await sendCart(res, email)
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+    /* remove one line. Idempotent -- removing what is already gone is fine */
+    app.delete('/cart/items/:menuItemId', verifyToken, async (req, res) => {
+      try {
+        const { email } = req.decoded
+
+        const menuItemId = toMenuItemId(req.params.menuItemId)
+
+        if (!menuItemId) {
+          return res.status(400).json({ success: false, message: 'Invalid menu item id' })
+        }
+
+        await cartCollection.updateOne(
+          { email },
+          { $pull: { items: { menuItemId } }, $set: { updatedAt: new Date() } }
+        )
+
+        await sendCart(res, email)
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+    /* empty the cart but keep the document, so the unique index on email does
+       not have to be re-satisfied on the next add */
+    app.delete('/cart', verifyToken, async (req, res) => {
+      try {
+        const { email } = req.decoded
+
+        await cartCollection.updateOne(
+          { email },
+          { $set: { items: [], updatedAt: new Date() } }
+        )
+
+        await sendCart(res, email)
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+
     app.listen(port, () => {
        console.log(`Server is running on port ${port}`)
     })
