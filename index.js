@@ -12,6 +12,11 @@ const { validateSellerRequest } = require("./utils/sellerRequest");
 const { validateMenuItem } = require("./utils/menuItem");
 const { normalizeQuantity, toMenuItemId, 
         hydrateCart, maxQuantity } = require("./utils/cart");
+const payments = require("./utils/payment");       
+const { validateCheckout, groupByRestaurant, 
+  checkoutTotal, makeOrderNumber, forCustomer } = require("./utils/order");  
+const notify = require("./utils/notification"); 
+
 
 // MongoDB
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
@@ -25,6 +30,8 @@ const client = new MongoClient(process.env.MONGODB_URI, {
 });
 
 app.use(express.json());
+
+app.use(express.urlencoded({ extended: true }));
 
 app.use(
   cors({
@@ -47,6 +54,9 @@ async function run() {
     const restaurantCollection = db.collection('restaurants') 
     const menuItemCollection = db.collection('menuItems')
     const cartCollection = db.collection('carts')
+    const orderCollection = db.collection('orders')
+    const notificationCollection = db.collection('notifications')
+
     
     const adminOnly = requireAdmin(userCollection) 
     const sellerOnly = requireSeller(userCollection, restaurantCollection)
@@ -604,7 +614,7 @@ async function run() {
 
 
     // Cart related API's
-        const sendCart = async (res, email) => {
+      const sendCart = async (res, email) => {
       const cart = await cartCollection.findOne({ email })
 
       const { items, subtotal, removed, staleIds } = await hydrateCart(cart, menuItemCollection)
@@ -638,13 +648,7 @@ async function run() {
       }
     })
 
-    /*
-      Add a dish that is already there.
-
-      The dish is checked against the live menu first, so a hidden dish or one
-      belonging to a suspended restaurant cannot be added even if the id came
-      from a page that was left open.
-    */
+    /* Add a dish that is already there. */
     app.post('/cart/items', verifyToken, async (req, res) => {
       try {
         const { email, uid } = req.decoded
@@ -773,7 +777,6 @@ async function run() {
       }
     })
 
-    /* remove one line. Idempotent -- removing what is already gone is fine */
     app.delete('/cart/items/:menuItemId', verifyToken, async (req, res) => {
       try {
         const { email } = req.decoded
@@ -811,6 +814,601 @@ async function run() {
         res.status(500).json({ success: false, message: err.message })
       }
     })
+
+
+     // Payment related API's
+    const settleCheckout = async ({ checkoutId, provider, transactionId, amount }) => {
+      const session = client.startSession()
+
+      try {
+        return await session.withTransaction(async () => {
+          const orders = await orderCollection
+            .find({ checkoutId }, { session })
+            .toArray()
+
+          const payable = orders.filter((order) => order.status === 'awaiting_payment')
+
+          if (payable.length === 0) return { settled: 0 }
+
+          /* the full checkout, not just what is still waiting: this is the
+             figure the gateway was asked for when the session started */
+          const owed = checkoutTotal(orders)
+
+          if (amount !== null && amount !== undefined
+            && Math.abs(amount - owed) > 0.01) {
+            const error = new Error(
+              `Paid amount ${amount} does not match the ${owed} owed for this checkout`
+            )
+            error.statusCode = 409
+            throw error
+          }
+
+          const paidAt = new Date()
+          const payment = { provider, transactionId, paidAt, amount: owed }
+
+          await orderCollection.updateMany(
+            { checkoutId, status: 'awaiting_payment' },
+            { $set: { status: 'placed', paymentStatus: 'paid', payment, updatedAt: paidAt } },
+            { session }
+          )
+
+          /* the money landed, so the cart that produced it is spent */
+          await cartCollection.updateMany(
+            { email: { $in: [...new Set(orders.map((order) => order.customerEmail))] } },
+            { $set: { items: [], updatedAt: paidAt } },
+            { session }
+          )
+
+          await notificationCollection.insertMany(
+            payable.map((order) => notify.orderPlacedForSeller({
+              ...order,
+              status: 'placed',
+              paymentStatus: 'paid',
+            })),
+            { session }
+          )
+
+          return { settled: payable.length }
+        }, session)
+      } finally {
+        await session.endSession()
+      }
+    }
+
+    const releaseCheckout = async (checkoutId) => {
+      const session = client.startSession()
+
+      try {
+        return await session.withTransaction(async () => {
+          const orders = await orderCollection
+            .find({ checkoutId, status: 'awaiting_payment' }, { session })
+            .toArray()
+
+          if (orders.length === 0) return { released: 0 }
+
+          for (const order of orders) {
+            await releaseStock(order.items, session)
+          }
+
+          await orderCollection.updateMany(
+            { checkoutId, status: 'awaiting_payment' },
+            {
+              $set: { status: 'cancelled', paymentStatus: 'failed', updatedAt: new Date() },
+            },
+            { session }
+          )
+
+          return { released: orders.length }
+        }, session)
+      } finally {
+        await session.endSession()
+      }
+    }
+
+    const findCheckout = async (checkoutId) => {
+      const orders = await orderCollection.find({ checkoutId }).toArray()
+
+      if (orders.length === 0) return null
+
+      return orders
+    }    
+    
+
+    app.post('/payments/mock/:checkoutId/confirm', verifyToken, async (req, res) => {
+      try {
+        if (payments.provider !== 'mock') {
+          return res.status(404).json({
+            success: false,
+            message: 'The mock payment page is not enabled',
+          })
+        }
+
+        const { checkoutId } = req.params
+        const outcome = ['success', 'fail', 'cancel'].includes(req.body?.outcome)
+          ? req.body.outcome
+          : 'fail'
+
+        const orders = await findCheckout(checkoutId)
+
+        if (!orders || !orders.some((order) => order.customerEmail === req.decoded.email)) {
+          return res.status(404).json({ success: false, message: 'No checkout with that id' })
+        }
+
+        const verdict = await payments.verifyPayment({ checkoutId, outcome })
+
+        if (verdict.paid) {
+          const result = await settleCheckout({
+            checkoutId,
+            provider: 'mock',
+            transactionId: verdict.transactionId,
+            amount: null,
+          })
+
+          return res.send({ success: true, outcome: 'paid', settled: result.settled })
+        }
+
+        if (outcome === 'cancel') {
+          const result = await releaseCheckout(checkoutId)
+
+          return res.send({ success: true, outcome: 'cancelled', released: result.released })
+        }
+
+        /* a failed attempt keeps the checkout alive, so it can be retried */
+        res.send({ success: true, outcome: 'failed', settled: 0 })
+      } catch (err) {
+        res.status(err.statusCode || 500).json({ success: false, message: err.message })
+      }
+    })
+
+    
+    const sslCommerzReturn = async (req, res) => {
+      const source = { ...req.query, ...req.body }
+      const checkoutId = String(source.tran_id || '')
+      const validationId = String(source.val_id || '')
+      const asked = String(source.outcome || 'success').toLowerCase()
+
+      const forward = (outcome) => res.redirect(
+        `${payments.clientUrl}/checkout/result/${encodeURIComponent(checkoutId)}` +
+        `?outcome=${encodeURIComponent(outcome)}`
+      )
+
+      try {
+        if (payments.provider !== 'sslcommerz') {
+          return res.status(404).json({
+            success: false,
+            message: 'SSLCommerz is not the payment provider in use',
+          })
+        }
+
+        if (!checkoutId) return res.redirect(`${payments.clientUrl}/`)
+
+        if (validationId) {
+          const verdict = await payments.verifyPayment({ checkoutId, validationId })
+
+          if (verdict.paid) {
+            try {
+              await settleCheckout({
+                checkoutId,
+                provider: 'sslcommerz',
+                transactionId: verdict.transactionId,
+                amount: verdict.amount,
+              })
+            } catch (error) {
+              /* an amount that does not match must never read as a success */
+              console.error(`Could not settle checkout ${checkoutId}:`, error.message)
+
+              return forward('mismatch')
+            }
+
+            return forward('success')
+          }
+
+          /* the gateway sent the customer back but its own validator says no
+             money arrived, so the checkout stays payable and can be retried */
+          if (asked === 'cancel') await releaseCheckout(checkoutId)
+
+          return forward(asked === 'cancel' ? 'cancel' : 'fail')
+        }
+
+        if (asked === 'cancel') await releaseCheckout(checkoutId)
+
+        return forward(asked === 'cancel' ? 'cancel' : 'fail')
+      } catch (err) {
+        console.error('SSLCommerz return error:', err)
+
+        return forward('fail')
+      }
+    }    
+
+    app.get('/payments/sslcommerz/return', sslCommerzReturn)
+    app.post('/payments/sslcommerz/return', sslCommerzReturn)
+
+
+    const sslCommerzIpn = async (req, res) => {
+      try {
+        if (payments.provider !== 'sslcommerz') {
+          return res.status(404).send('SSLCommerz is not the payment provider in use')
+        }
+
+        const source = { ...req.query, ...req.body }
+        const checkoutId = String(source.tran_id || '')
+        const validationId = String(source.val_id || '')
+        const status = String(source.status || '').toLowerCase()
+
+        if (!checkoutId || !validationId) {
+          return res.status(400).send('Missing tran_id or val_id')
+        }
+
+        const verdict = await payments.verifyPayment({ checkoutId, validationId })
+
+        if (verdict.paid) {
+          await settleCheckout({
+            checkoutId,
+            provider: 'sslcommerz',
+            transactionId: verdict.transactionId,
+            amount: verdict.amount,
+          })
+        } else if (status.includes('cancel')) {
+          await releaseCheckout(checkoutId)
+        }
+
+        /* the gateway only wants to know it was heard; a duplicate IPN hits
+           the guarded update inside settleCheckout and changes nothing */
+        res.status(200).send('OK')
+      } catch (err) {
+        console.error('SSLCommerz IPN error:', err)
+        res.status(500).send(err.message)
+      }
+    }
+
+    app.post('/payments/sslcommerz/ipn', sslCommerzIpn)
+    app.get('/payments/sslcommerz/ipn', sslCommerzIpn)
+
+
+    app.get('/payments/:checkoutId', verifyToken, async (req, res) => {
+      try {
+        const { checkoutId } = req.params
+
+        const orders = await findCheckout(checkoutId)
+
+        if (!orders) {
+          return res.status(404).json({ success: false, message: 'No checkout with that id' })
+        }
+
+        const { email } = req.decoded
+        const account = await userCollection.findOne({ email })
+
+        const isAdmin = account?.role === 'admin'
+        const isCustomer = orders.every((order) => order.customerEmail === email)
+        const isOwner = orders.some((order) => order.ownerEmail === email)
+
+        if (!isAdmin && !isCustomer && !isOwner) {
+          return res.status(404).json({ success: false, message: 'No checkout with that id' })
+        }
+
+        const state = orders.every((order) => order.status === 'cancelled')
+          ? 'released'
+          : orders.some((order) => order.status === 'awaiting_payment')
+            ? 'awaiting_payment'
+            : 'settled'
+
+        res.send({
+          success: true,
+          checkoutId,
+          provider: payments.provider,
+          paymentMethod: orders[0].paymentMethod,
+          state,
+          total: checkoutTotal(orders),
+          orders: isCustomer && !isAdmin ? orders.map(forCustomer) : orders,
+        })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+    
+
+    app.post('/payments/:checkoutId/initiate', verifyToken, async (req, res) => {
+      try {
+        const { checkoutId } = req.params
+
+        const orders = await orderCollection
+          .find({ checkoutId, status: 'awaiting_payment' })
+          .toArray()
+
+        if (orders.length === 0
+          || !orders.every((order) => order.customerEmail === req.decoded.email)) {
+          return res.status(404).json({
+            success: false,
+            message: 'No unpaid checkout with that id',
+          })
+        }
+
+        let gateway
+
+        try {
+          gateway = await payments.initiatePayment({
+            checkoutId,
+            amount: checkoutTotal(orders),
+            customer: {
+              name: orders[0].delivery.name,
+              email: req.decoded.email,
+              phone: orders[0].delivery.phone,
+              address: orders[0].delivery.address,
+            },
+            itemCount: orders.reduce((sum, order) => sum + (order.itemCount || 0), 0),
+          })
+        } catch (error) {
+          return res.status(502).json({ success: false, message: error.message })
+        }
+
+        res.send({
+          success: true,
+          redirectUrl: gateway.redirectUrl,
+          provider: payments.provider,
+        })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })    
+
+    
+    // Orders related APIs
+    const reserveStock = async (lines, session) => {
+      for (const line of lines) {
+        const dish = await menuItemCollection.findOne({ _id: line.menuItemId }, { session })
+
+        if (!dish || dish.available === false) {
+          const error = new Error(`${line.name} is not on the menu right now`)
+          error.statusCode = 409
+          throw error
+        }
+
+        if (typeof dish.quantity !== 'number') continue
+
+        if (dish.quantity < line.quantity) {
+          const error = new Error(
+            dish.quantity === 0
+              ? `${line.name} is sold out`
+              : `Only ${dish.quantity} left of ${line.name}`
+          )
+          error.statusCode = 409
+          throw error
+        }
+
+        const taken = await menuItemCollection.updateOne(
+          { _id: dish._id, quantity: { $gte: line.quantity } },
+          { $inc: { quantity: -line.quantity } },
+          { session }
+        )
+
+        if (taken.matchedCount === 0) {
+          const error = new Error(`${line.name} just sold out`)
+          error.statusCode = 409
+          throw error
+        }
+      }
+    }
+
+    const releaseStock = async (lines, session) => {
+      for (const line of lines) {
+        await menuItemCollection.updateOne(
+          { _id: line.menuItemId, quantity: { $type: 'number' } },
+          { $inc: { quantity: line.quantity } },
+          { session }
+        )
+      }
+    }
+
+    const insertOrder = async (draft, session) => {
+      let order = draft
+
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          const result = await orderCollection.insertOne(order, { session })
+
+          return { ...order, _id: result.insertedId }
+        } catch (error) {
+          if (error?.code !== 11000 || attempt === 4) throw error
+
+          const { _id, ...kept } = order
+          order = { ...kept, orderNumber: makeOrderNumber() }
+        }
+      }
+
+      return null
+    }
+
+    app.post('/orders', verifyToken, async (req, res) => {
+      try {
+        const { email } = req.decoded
+
+        const { errors, value } = validateCheckout(req.body)
+
+        if (errors.length) {
+          return res.status(400).json({ success: false, message: errors[0], errors })
+        }
+
+        const cart = await cartCollection.findOne({ email })
+        const { items, removed, staleIds } = await hydrateCart(cart, menuItemCollection)
+
+        /* dishes pulled from the menu while this cart was open -- prune the
+           lines and say so, rather than quietly ordering something else */
+        if (staleIds.length) {
+          await cartCollection.updateOne(
+            { email },
+            {
+              $pull: { items: { menuItemId: { $in: staleIds } } },
+              $set: { updatedAt: new Date() },
+            }
+          )
+        }
+
+        if (removed.length) {
+          return res.status(409).json({
+            success: false,
+            message: `${removed.join(', ')} ${
+              removed.length === 1 ? 'is' : 'are'
+            } no longer available, so your cart was updated`,
+            removed,
+          })
+        }
+
+        if (items.length === 0) {
+          return res.status(409).json({ success: false, message: 'Your cart is empty' })
+        }
+
+        const groups = groupByRestaurant(items)
+        const total = checkoutTotal(groups)
+        const itemCount = items.reduce((sum, line) => sum + line.quantity, 0)
+
+        const restaurants = await restaurantCollection
+          .find({ _id: { $in: groups.map((group) => group.restaurantId) } })
+          .toArray()
+
+        const byId = new Map(restaurants.map((one) => [String(one._id), one]))
+
+        for (const group of groups) {
+          const restaurant = byId.get(String(group.restaurantId))
+
+          if (!restaurant || restaurant.status !== 'active') {
+            return res.status(409).json({
+              success: false,
+              message: `${group.restaurantName} is not taking orders right now`,
+            })
+          }
+        }
+
+        const checkoutId = new ObjectId().toString()
+        const now = new Date()
+
+        const draftFor = (group) => ({
+          orderNumber: makeOrderNumber(),
+          checkoutId,
+          restaurantId: group.restaurantId,
+          restaurantName: group.restaurantName,
+          ownerEmail: byId.get(String(group.restaurantId)).ownerEmail,
+          customerEmail: email,
+          items: group.items,
+          itemsTotal: group.itemsTotal,
+          deliveryFee: group.deliveryFee,
+          total: group.total,
+          itemCount: group.items.reduce((sum, line) => sum + line.quantity, 0),
+          delivery: {
+            name: value.name,
+            phone: value.phone,
+            address: value.address,
+            note: value.note,
+          },
+          paymentMethod: value.paymentMethod,
+          paymentStatus: value.paymentMethod === 'online' ? 'pending' : 'unpaid',
+          payment: null,
+          status: value.paymentMethod === 'online' ? 'awaiting_payment' : 'placed',
+          sellerNote: '',
+          placedAt: now,
+          updatedAt: now,
+        })
+
+        let gateway = null
+
+        if (value.paymentMethod === 'online') {
+          try {
+            gateway = await payments.initiatePayment({
+              checkoutId,
+              amount: total,
+              customer: {
+                name: value.name,
+                email,
+                phone: value.phone,
+                address: value.address,
+              },
+              itemCount,
+            })
+          } catch (error) {
+            return res.status(502).json({ success: false, message: error.message })
+          }
+        }
+
+        const session = client.startSession()
+
+        let created
+
+        try {
+          created = await session.withTransaction(async () => {
+            /*
+              A checkout somebody walked away from would hold its reservations
+              forever, so anything of this customer's still awaiting payment
+              after half an hour is given up here. Anything younger is left
+              alone -- it may be the tab they are paying in right now.
+            */
+            const stale = await orderCollection
+              .find({
+                customerEmail: email,
+                status: 'awaiting_payment',
+                placedAt: { $lt: new Date(Date.now() - 30 * 60 * 1000) },
+              }, { session })
+              .toArray()
+
+            for (const old of stale) {
+              await releaseStock(old.items, session)
+            }
+
+            if (stale.length) {
+              await orderCollection.updateMany(
+                { _id: { $in: stale.map((order) => order._id) } },
+                {
+                  $set: { status: 'cancelled', paymentStatus: 'failed', updatedAt: new Date() },
+                },
+                { session }
+              )
+            }
+
+            const drafts = groups.map(draftFor)
+
+            for (const draft of drafts) {
+              await reserveStock(draft.items, session)
+            } 
+
+            const orders = []
+
+            for (const draft of drafts) {
+              orders.push(await insertOrder(draft, session))
+            }
+
+            if (value.paymentMethod === 'cod') {
+              await notificationCollection.insertMany(
+                orders.map((order) => notify.orderPlacedForSeller(order)),
+                { session }
+              )
+
+              await cartCollection.updateOne(
+                { email },
+                { $set: { items: [], updatedAt: new Date() } },
+                { session }
+              )
+            }
+
+            return orders
+          }, session)
+        } finally {
+          await session.endSession()
+        }
+
+        res.status(201).json({
+          success: true,
+          checkoutId,
+          total,
+          itemCount,
+          paymentMethod: value.paymentMethod,
+          orders: created.map(forCustomer),
+          /* where to send the browser next; empty for cash on delivery */
+          redirectUrl: gateway?.redirectUrl || '',
+          provider: payments.provider,
+        })
+      } catch (err) {
+        res.status(err.statusCode || 500).json({ success: false, message: err.message })
+      }
+    })
+
 
 
     app.listen(port, () => {
