@@ -39,7 +39,55 @@ const orderPlacedForSeller = (order) => build({
   link: '/dashboard/orders',
 })
 
+const orderAcceptedForCustomer = (order) => build({
+  email: order.customerEmail,
+  role: 'customer',
+  type: 'order_accepted',
+  title: `${order.restaurantName} accepted your order`,
+  body: `${order.orderNumber} is being prepared.`
+    + (order.sellerNote ? ` They said: ${order.sellerNote}` : ''),
+  order,
+  link: '/dashboard/my-orders',
+})
+
+const orderRejectedForCustomer = (order) => build({
+  email: order.customerEmail,
+  role: 'customer',
+  type: 'order_rejected',
+  title: `${order.restaurantName} could not take your order`,
+  body: (order.sellerNote ? `They said: ${order.sellerNote}` : 'No reason was given.')
+    + (order.paymentStatus === 'refund_due'
+      ? ` Your ${currency(order.total)} payment will be refunded.`
+      : ''),
+  order,
+  link: '/dashboard/my-orders',
+})
+
+const orderCompletedForCustomer = (order) => build({
+  email: order.customerEmail,
+  role: 'customer',
+  type: 'order_completed',
+  title: `${order.orderNumber} was delivered`,
+  body: `Enjoy your food from ${order.restaurantName}.`,
+  order,
+  link: '/dashboard/my-orders',
+})
+
+const orderCancelledForSeller = (order) => build({
+  email: order.ownerEmail,
+  role: 'seller',
+  type: 'order_cancelled',
+  title: `${order.orderNumber} was cancelled`,
+  body: `${order.delivery.name} cancelled before you answered, so there is nothing to cook.`,
+  order,
+  link: '/dashboard/orders',
+})
+
 module.exports = {
   notificationTypes,
   orderPlacedForSeller,
+  orderAcceptedForCustomer,
+  orderRejectedForCustomer,
+  orderCompletedForCustomer,
+  orderCancelledForSeller,
 }

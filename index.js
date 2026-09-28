@@ -1218,6 +1218,27 @@ async function run() {
       return null
     }
 
+    const buildOrderFilter = (query = {}) => {
+      const { status, paymentStatus } = query
+      const filter = {}
+
+      if (status === 'open') {
+        filter.status = { $in: openStatuses }
+      } else if (status && !orderStatuses.includes(status)) {
+        return { error: `status must be one of: ${orderStatuses.join(', ')}` }
+      } else if (status) {
+        filter.status = status
+      }
+
+      if (paymentStatus && !paymentStatuses.includes(paymentStatus)) {
+        return { error: `paymentStatus must be one of: ${paymentStatuses.join(', ')}` }
+      }
+
+      if (paymentStatus) filter.paymentStatus = paymentStatus
+
+      return { filter }
+    }    
+
     app.post('/orders', verifyToken, async (req, res) => {
       try {
         const { email } = req.decoded
@@ -1410,6 +1431,246 @@ async function run() {
     })
 
 
+    /* the customer's own history, newest first, without the seller's email */
+    app.get('/orders/mine', verifyToken, async (req, res) => {
+      try {
+        const { filter, error } = buildOrderFilter(req.query)
+
+        if (error) return res.status(400).json({ success: false, message: error })
+
+        const orders = await orderCollection
+          .find({ ...filter, customerEmail: req.decoded.email })
+          .sort({ placedAt: -1 })
+          .limit(200)
+          .toArray()
+
+        res.send({ success: true, orders: orders.map(forCustomer) })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+    
+    app.get('/orders/seller', verifyToken, sellerOnly, async (req, res) => {
+      try {
+        const { filter, error } = buildOrderFilter(req.query)
+
+        if (error) return res.status(400).json({ success: false, message: error })
+
+        const orders = await orderCollection
+          .find({ ...filter, restaurantId: req.restaurant._id })
+          .sort({ placedAt: -1 })
+          .limit(200)
+          .toArray()
+
+        res.send({ success: true, orders })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+
+    /* every order on the platform, admin only */
+    app.get('/orders/all', verifyToken, adminOnly, async (req, res) => {
+      try {
+        const { filter, error } = buildOrderFilter(req.query)
+
+        if (error) return res.status(400).json({ success: false, message: error })
+
+        const orders = await orderCollection
+          .find(filter)
+          .sort({ placedAt: -1 })
+          .limit(500)
+          .toArray()
+
+        res.send({ success: true, orders })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+
+    app.get('/orders/:id', verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ success: false, message: 'Invalid order id' })
+        }
+
+        const order = await orderCollection.findOne({ _id: new ObjectId(id) })
+
+        if (!order) {
+          return res.status(404).json({ success: false, message: 'No order with that id' })
+        }
+
+        const { email } = req.decoded
+        const account = await userCollection.findOne({ email })
+
+        const isAdmin = account?.role === 'admin'
+        const isCustomer = order.customerEmail === email
+        const isOwner = order.ownerEmail === email
+
+        if (!isAdmin && !isCustomer && !isOwner) {
+          return res.status(404).json({ success: false, message: 'No order with that id' })
+        }
+
+        res.send({
+          success: true,
+          order: isCustomer && !isAdmin ? forCustomer(order) : order,
+          viewer: isAdmin ? 'admin' : isOwner ? 'seller' : 'customer',
+        })
+      } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+      }
+    })
+
+
+    const statusTransitions = {
+      seller: {
+        placed: ['accepted', 'rejected'],
+        accepted: ['completed'],
+      },
+      customer: {
+        placed: ['cancelled'],
+        awaiting_payment: ['cancelled'],
+      },
+      admin: {
+        placed: ['accepted', 'rejected', 'completed', 'cancelled'],
+        accepted: ['completed', 'cancelled'],
+        awaiting_payment: ['cancelled'],
+      },
+    }
+
+
+    app.patch('/orders/:id/status', verifyToken, async (req, res) => {
+      try {
+        const { id } = req.params
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ success: false, message: 'Invalid order id' })
+        }
+
+        const target = typeof req.body?.status === 'string' ? req.body.status.trim() : ''
+
+        if (!['accepted', 'rejected', 'completed', 'cancelled'].includes(target)) {
+          return res.status(400).json({
+            success: false,
+            message: "status must be one of 'accepted', 'rejected', 'completed' or 'cancelled'",
+          })
+        }
+
+        const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 300) : ''
+        const { email } = req.decoded
+        const account = await userCollection.findOne({ email })
+        const orderId = new ObjectId(id)
+
+        const session = client.startSession()
+
+        let outcome
+
+        try {
+          outcome = await session.withTransaction(async () => {
+            const order = await orderCollection.findOne({ _id: orderId }, { session })
+
+            if (!order) {
+              const error = new Error('No order with that id')
+              error.statusCode = 404
+              throw error
+            }
+
+            /* the role is read from mongo and matched against the order, so
+               the caller never gets to say which side they are on */
+            const viewer = account?.role === 'admin'
+              ? 'admin'
+              : order.customerEmail === email
+                ? 'customer'
+                : order.ownerEmail === email
+                  ? 'seller'
+                  : null
+
+            if (!viewer) {
+              const error = new Error('No order with that id')
+              error.statusCode = 404
+              throw error
+            }
+
+            const allowed = statusTransitions[viewer][order.status] || []
+
+            if (!allowed.includes(target)) {
+              const error = new Error(
+                `An order that is ${order.status.replace('_', ' ')} cannot become ` +
+                `${target.replace('_', ' ')} for ${viewer === 'admin' ? 'an admin' : `a ${viewer}`}`
+              )
+              error.statusCode = 409
+              throw error
+            }
+
+            const now = new Date()
+            const set = { status: target, updatedAt: now }
+
+            /* the kitchen's reason, shown to the customer on the order card */
+            if (note && viewer !== 'customer') set.sellerNote = note
+
+            
+            if (target === 'completed' && order.paymentMethod === 'cod') {
+              set.paymentStatus = 'paid'
+            }
+
+            if ((target === 'rejected' || target === 'cancelled')
+              && order.paymentStatus === 'paid') {
+              set.paymentStatus = 'refund_due'
+            }
+
+            /* a checkout that was never paid leaves nothing owed behind */
+            if (target === 'cancelled' && order.status === 'awaiting_payment') {
+              set.paymentStatus = 'failed'
+            }
+
+            const updated = await orderCollection.findOneAndUpdate(
+              { _id: orderId, status: order.status },
+              { $set: set },
+              { returnDocument: 'after', includeResultMetadata: false, session }
+            )
+
+            if (target === 'cancelled' || target === 'rejected') {
+              await releaseStock(order.items, session)
+            }
+
+            const messages = {
+              accepted: notify.orderAcceptedForCustomer,
+              rejected: notify.orderRejectedForCustomer,
+              completed: notify.orderCompletedForCustomer,
+            }
+
+            const told = { ...order, ...set }
+
+            if (messages[target]) {
+              await notificationCollection.insertOne(messages[target](told), { session })
+            } else if (target === 'cancelled' && order.status !== 'awaiting_payment') {
+              /* the seller never saw an unpaid checkout, so there is nothing
+                 to tell them about it disappearing */
+              await notificationCollection.insertOne(
+                notify.orderCancelledForSeller(told),
+                { session }
+              )
+            }
+
+            return { order: updated, viewer }
+          }, session)
+        } finally {
+          await session.endSession()
+        }
+
+        res.send({
+          success: true,
+          order: outcome.viewer === 'customer' ? forCustomer(outcome.order) : outcome.order,
+        })
+      } catch (err) {
+        res.status(err.statusCode || 500).json({ success: false, message: err.message })
+      }
+    })
+    
 
     app.listen(port, () => {
        console.log(`Server is running on port ${port}`)
