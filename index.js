@@ -419,7 +419,81 @@ async function run() {
           message: err.message })
       }
     })  
-  
+
+    
+    app.patch('/users/:id/role', verifyToken, adminOnly, async (req, res) => {
+      try {
+        const { id } = req.params
+        const { role } = req.body || {}
+
+        // Validate user ID
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid user id',
+          })
+        }
+
+        // Validate role
+        const allowedRoles = ['customer', 'seller', 'admin']
+
+        if (!allowedRoles.includes(role)) {
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid role',
+          })
+        }
+
+        const userId = new ObjectId(id)
+
+        // Find target user
+        const account = await userCollection.findOne({ _id: userId })
+
+        if (!account) {
+          return res.status(404).json({
+            success: false,
+            message: 'User not found',
+          })
+        }
+
+        // Optional: prevent an admin from changing their own role
+        if (account.email === req.decoded.email) {
+          return res.status(403).json({
+            success: false,
+            message: 'You cannot change your own role',
+          })
+        }
+
+        const updated = await userCollection.findOneAndUpdate(
+          { _id: userId },
+          {
+            $set: {
+              role,
+              roleUpdatedAt: new Date(),
+              roleUpdatedBy: req.decoded.email,
+            },
+          },
+          {
+            returnDocument: 'after',
+            includeResultMetadata: false,
+          }
+        )
+
+        return res.send({
+          success: true,
+          message: `User role updated to ${role}`,
+          user: updated,
+        })
+      } catch (err) {
+        console.error('Role update error:', err)
+
+        return res.status(500).json({
+          success: false,
+          message: 'Could not update user role',
+        })
+      }
+    })
+      
 
    // Restaurant related API's
 
@@ -1612,7 +1686,7 @@ async function run() {
             /* the kitchen's reason, shown to the customer on the order card */
             if (note && viewer !== 'customer') set.sellerNote = note
 
-            
+
             if (target === 'completed' && order.paymentMethod === 'cod') {
               set.paymentStatus = 'paid'
             }
